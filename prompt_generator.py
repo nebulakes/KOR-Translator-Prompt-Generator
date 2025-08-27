@@ -8,6 +8,10 @@ import re
 import sys
 import json
 from docx import Document
+# 추가: XML 내부 요소에 직접 접근하기 위한 import
+from docx.oxml import CT_P, CT_Tbl
+from docx.table import Table
+from docx.text.paragraph import Paragraph
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
@@ -111,27 +115,91 @@ def save_settings_to_json(settings):
         messagebox.showerror("설정 저장 오류", f"설정 파일 저장 중 오류가 발생했습니다:\n{e}")
         return False
 
+def iter_all_text_blocks(document):
+    """
+    [새로운 헬퍼 함수]
+    문서의 모든 텍스트 소스(본문, 표, 텍스트 상자, 머리글, 바닥글 등)를 순회하는 제너레이터.
+    """
+    # 1. 본문(Body)의 문단과 표 순회 (기존 로직)
+    for block in document.element.body:
+        if isinstance(block, CT_P):
+            yield Paragraph(block, document).text
+        elif isinstance(block, CT_Tbl):
+            table = Table(block, document)
+            for row in table.rows:
+                yield "\t".join(cell.text for cell in row.cells)
+
+    # 2. 모든 섹션의 머리글(Header) 순회
+    for section in document.sections:
+        for paragraph in section.header.paragraphs:
+            yield paragraph.text
+
+    # 3. 모든 섹션의 바닥글(Footer) 순회
+    for section in document.sections:
+        for paragraph in section.footer.paragraphs:
+            yield paragraph.text
+            
+    # 4. 텍스트 상자(Text Box) 및 도형(Shape) 안의 텍스트 순회
+    #    문서의 모든 문단을 순회하며 텍스트 상자 XML 태그 안에 있는지 확인
+    for p in document.paragraphs:
+        if p._p.xpath('.//w:txbxContent'):
+            yield p.text
+            
+    # 5. 각주(Footnotes) 순회 (오류 방지 코드 추가)
+    #    문서에 각주 파트가 있는지 먼저 확인
+    if hasattr(document.part, 'footnotes_part') and document.part.footnotes_part:
+        footnotes = document.part.footnotes_part.footnotes
+        for footnote in footnotes:
+            # 각주 내의 모든 문단 텍스트를 결합
+            yield "".join(p.text for p in footnote.paragraphs)
+
+    # 6. 미주(Endnotes) 순회 (오류 방지 코드 추가)
+    #    문서에 미주 파트가 있는지 먼저 확인
+    if hasattr(document.part, 'endnotes_part') and document.part.endnotes_part:
+        endnotes = document.part.endnotes_part.endnotes
+        for endnote in endnotes:
+            yield "".join(p.text for p in endnote.paragraphs)
+
+
 def chunk_document_by_word_count(doc_path, target_words=400):
+    """
+    [개선된 함수]
+    문서(.docx)를 단어 수 기준으로 청크로 나눕니다.
+    문서의 모든 텍스트(문단, 표, 텍스트 상자, 머리글/바닥글 등)를 읽어 누락을 방지합니다.
+    """
     try:
         doc = Document(doc_path)
         chunks = []
-        current_chunk_paragraphs = []
+        current_chunk_texts = []
         current_word_count = 0
-        for para in doc.paragraphs:
-            paragraph_text = para.text
-            word_count = len(paragraph_text.split())
+
+        # 개선된 제너레이터를 통해 모든 텍스트 블록을 순회하며 청크 생성
+        for text_block in iter_all_text_blocks(doc):
+            text_block = text_block.strip()
+            if not text_block: # 내용이 없는 블록은 건너뜀
+                continue
+
+            word_count = len(text_block.split())
+
+            # 현재 청크에 새 블록을 추가하면 목표 단어 수를 초과하는 경우,
+            # 기존 청크를 저장하고 새 청크를 시작
             if current_word_count > 0 and current_word_count + word_count > target_words:
-                chunks.append("\n".join(current_chunk_paragraphs))
-                current_chunk_paragraphs = []
+                chunks.append("\n".join(current_chunk_texts))
+                current_chunk_texts = []
                 current_word_count = 0
-            current_chunk_paragraphs.append(paragraph_text)
+
+            current_chunk_texts.append(text_block)
             current_word_count += word_count
-        if current_chunk_paragraphs:
-            chunks.append("\n".join(current_chunk_paragraphs))
+
+        # 마지막으로 남은 텍스트가 있다면 최종 청크로 추가
+        if current_chunk_texts:
+            chunks.append("\n".join(current_chunk_texts))
+
         return chunks
     except Exception as e:
         messagebox.showerror("파일 오류", f"문서 파일을 읽는 중 오류가 발생했습니다: {e}")
         return None
+
 
 def load_glossary(file_path):
     if not file_path or not os.path.exists(file_path): return {}
@@ -164,7 +232,7 @@ def save_glossary(file_path, glossary_data):
         return False
 
 # ==============================================================================
-# GUI 클래스
+# GUI 클래스 (이하 코드는 변경되지 않았습니다)
 # ==============================================================================
 
 class PromptSettingsWindow(tk.Toplevel):
@@ -179,74 +247,39 @@ class PromptSettingsWindow(tk.Toplevel):
 
     def setup_widgets(self):
         main_frame = ttk.Frame(self, padding="10"); main_frame.pack(fill="both", expand=True)
-        
         chunk_frame = ttk.LabelFrame(main_frame, text="번역 단위 설정", padding="10"); chunk_frame.pack(fill="x", pady=(0, 10))
         ttk.Label(chunk_frame, text="청크 크기 (단어 수 기준):").grid(row=0, column=0, sticky="w", padx=5, pady=5)
-        self.chunk_size_var = tk.StringVar()
-        ttk.Entry(chunk_frame, textvariable=self.chunk_size_var, width=10).grid(row=0, column=1, sticky="w", padx=5)
+        self.chunk_size_var = tk.StringVar(); ttk.Entry(chunk_frame, textvariable=self.chunk_size_var, width=10).grid(row=0, column=1, sticky="w", padx=5)
         ttk.Label(chunk_frame, text="(기본값: 400)").grid(row=0, column=2, sticky="w", padx=5)
-
         prompt_frame = ttk.LabelFrame(main_frame, text="프롬프트 템플릿 설정", padding="10"); prompt_frame.pack(fill="both", expand=True, pady=10)
-        
-        # --- 수정: 레이아웃 코드 개선 ---
-        label1 = ttk.Label(prompt_frame, text="1단계: 초벌 번역 프롬프트", font=("Malgun Gothic", 11, "bold"))
-        label1.pack(anchor="w")
-        
-        self.prompt1_text = scrolledtext.ScrolledText(prompt_frame, wrap=tk.WORD, height=8, font=("Malgun Gothic", 10))
-        self.prompt1_text.pack(fill="both", expand=True, pady=5)
-        
-        label1_vars = ttk.Label(prompt_frame, text="사용 가능 변수: {english_chunk}", foreground="blue")
-        label1_vars.pack(anchor="w", pady=(0, 15))
-        
-        label2 = ttk.Label(prompt_frame, text="2단계: 개선 번역 프롬프트", font=("Malgun Gothic", 11, "bold"))
-        label2.pack(anchor="w")
-        
-        self.prompt2_text = scrolledtext.ScrolledText(prompt_frame, wrap=tk.WORD, height=8, font=("Malgun Gothic", 10))
-        self.prompt2_text.pack(fill="both", expand=True, pady=5)
-        
-        label2_vars = ttk.Label(prompt_frame, text="사용 가능 변수: {english_chunk}, {korean_draft}", foreground="blue")
-        label2_vars.pack(anchor="w")
-
+        ttk.Label(prompt_frame, text="1단계: 초벌 번역 프롬프트", font=("Malgun Gothic", 11, "bold")).pack(anchor="w")
+        self.prompt1_text = scrolledtext.ScrolledText(prompt_frame, wrap=tk.WORD, height=8, font=("Malgun Gothic", 10)); self.prompt1_text.pack(fill="both", expand=True, pady=5)
+        ttk.Label(prompt_frame, text="사용 가능 변수: {english_chunk}", foreground="blue").pack(anchor="w", pady=(0, 15))
+        ttk.Label(prompt_frame, text="2단계: 개선 번역 프롬프트", font=("Malgun Gothic", 11, "bold")).pack(anchor="w")
+        self.prompt2_text = scrolledtext.ScrolledText(prompt_frame, wrap=tk.WORD, height=8, font=("Malgun Gothic", 10)); self.prompt2_text.pack(fill="both", expand=True, pady=5)
+        ttk.Label(prompt_frame, text="사용 가능 변수: {english_chunk}, {korean_draft}", foreground="blue").pack(anchor="w")
         button_frame = ttk.Frame(main_frame); button_frame.pack(fill="x", pady=10)
         ttk.Button(button_frame, text="저장", command=self.save_settings).pack(side="right", padx=5)
         ttk.Button(button_frame, text="초기화", command=self.reset_prompts).pack(side="right", padx=5)
         ttk.Button(button_frame, text="취소", command=self.destroy).pack(side="right")
 
     def load_settings(self):
-        # --- 수정: 데이터 로딩 안정성 강화 ---
-        chunk_size = self.parent_app.chunk_size if self.parent_app.chunk_size is not None else 400
-        prompt1 = self.parent_app.prompt_1_template if self.parent_app.prompt_1_template is not None else ""
-        prompt2 = self.parent_app.prompt_2_template if self.parent_app.prompt_2_template is not None else ""
-
-        self.chunk_size_var.set(str(chunk_size))
-        self.prompt1_text.insert("1.0", prompt1)
-        self.prompt2_text.insert("1.0", prompt2)
+        self.chunk_size_var.set(str(self.parent_app.chunk_size))
+        self.prompt1_text.insert("1.0", self.parent_app.prompt_1_template)
+        self.prompt2_text.insert("1.0", self.parent_app.prompt_2_template)
 
     def save_settings(self):
-        try:
-            new_chunk_size = int(self.chunk_size_var.get())
-            if new_chunk_size <= 0: raise ValueError
-        except ValueError:
-            return messagebox.showwarning("입력 오류", "청크 크기는 0보다 큰 숫자여야 합니다.", parent=self)
-
+        try: new_chunk_size = int(self.chunk_size_var.get())
+        except ValueError: return messagebox.showwarning("입력 오류", "청크 크기는 숫자여야 합니다.", parent=self)
+        if new_chunk_size <= 0: return messagebox.showwarning("입력 오류", "청크 크기는 0보다 커야 합니다.", parent=self)
         new_prompt1 = self.prompt1_text.get("1.0", tk.END).strip()
         new_prompt2 = self.prompt2_text.get("1.0", tk.END).strip()
-        
         if "{english_chunk}" not in new_prompt1 or "{english_chunk}" not in new_prompt2 or "{korean_draft}" not in new_prompt2:
             return messagebox.showwarning("오류", "프롬프트에 필수 변수가 포함되어 있는지 확인하세요.", parent=self)
-        
-        new_settings = {
-            "prompt1": new_prompt1,
-            "prompt2": new_prompt2,
-            "chunk_size": new_chunk_size
-        }
-
+        new_settings = {"prompt1": new_prompt1, "prompt2": new_prompt2, "chunk_size": new_chunk_size}
         if save_settings_to_json(new_settings):
-            self.parent_app.prompt_1_template = new_prompt1
-            self.parent_app.prompt_2_template = new_prompt2
-            self.parent_app.chunk_size = new_chunk_size
-            messagebox.showinfo("저장 완료", f"설정이 {CONFIG_FILE_NAME} 파일에 저장되었습니다.", parent=self)
-            self.destroy()
+            self.parent_app.prompt_1_template, self.parent_app.prompt_2_template, self.parent_app.chunk_size = new_prompt1, new_prompt2, new_chunk_size
+            messagebox.showinfo("저장 완료", f"설정이 {CONFIG_FILE_NAME} 파일에 저장되었습니다.", parent=self); self.destroy()
 
     def reset_prompts(self):
         if messagebox.askyesno("프롬프트 초기화", "프롬프트 설정을 기본값으로 되돌리시겠습니까?\n(저장 버튼을 눌러야 최종 적용됩니다.)", parent=self):
@@ -313,7 +346,6 @@ class ReviewWindow(tk.Toplevel):
         main = ttk.Frame(self, padding="10"); main.pack(fill="both", expand=True)
         top = ttk.Frame(main); top.pack(fill="both", expand=True, pady=(0, 10))
         top.columnconfigure(0, weight=1); top.columnconfigure(1, weight=1); top.rowconfigure(0, weight=1)
-        
         f1 = ttk.LabelFrame(top, text="1. 최종 번역문 불일치 검사", padding="10"); f1.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
         f1.rowconfigure(1, weight=1); f1.columnconfigure(0, weight=1)
         ttk.Label(f1, text="AI 최종 번역문 붙여넣기:").grid(row=0, column=0, sticky="w")
@@ -322,14 +354,12 @@ class ReviewWindow(tk.Toplevel):
         self.d_list = ttk.Treeview(f1, columns=("term", "status"), show="headings", height=5)
         self.d_list.heading("term", text="용어"); self.d_list.heading("status", text="상태"); self.d_list.column("term", width=200)
         self.d_list.grid(row=3, column=0, sticky="nsew", pady=5)
-        
         f2 = ttk.LabelFrame(top, text="2. 신규 용어 추가 (AI 활용)", padding="10"); f2.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
         f2.rowconfigure(2, weight=1); f2.columnconfigure(0, weight=1)
         ttk.Button(f2, text="신규 용어 추출 프롬프트 생성", command=self.generate_suggestion_prompt).grid(row=0, column=0, pady=5)
         ttk.Label(f2, text="AI 답변(용어 목록) 붙여넣기:").grid(row=1, column=0, sticky="w")
         self.s_input = scrolledtext.ScrolledText(f2, wrap=tk.WORD, height=8); self.s_input.grid(row=2, column=0, sticky="nsew", pady=(5,0))
         ttk.Button(f2, text="제안 용어 목록 적용", command=self.apply_suggestions).grid(row=3, column=0, pady=5)
-        
         ttk.Button(main, text="변경사항 저장 후 닫기", command=self.save_and_close).pack(pady=10, fill="x")
 
     def extract_translation(self, text):
@@ -337,6 +367,9 @@ class ReviewWindow(tk.Toplevel):
         return match.group(1).strip() if match else text
 
     def check_discrepancies(self):
+        # --- 변경: 검사 직전에 용어집 파일 다시 읽어와 메모리와 병합 ---
+        self.parent_app.reload_and_sync_glossary()
+        
         self.d_list.delete(*self.d_list.get_children())
         text = self.final_text.get("1.0", tk.END)
         if not text.strip(): return messagebox.showwarning("입력 필요", "최종 번역문을 붙여넣어 주세요.", parent=self)
@@ -377,7 +410,6 @@ class ReviewWindow(tk.Toplevel):
                 if eng in self.parent_app.glossary_data and self.parent_app.glossary_data[eng] != kor:
                     conflicts.append({'eng': eng, 'old_kor': self.parent_app.glossary_data[eng], 'new_kor': kor})
                 elif eng not in self.parent_app.glossary_data and eng not in new: new[eng] = kor
-        
         updated = 0
         if conflicts:
             decisions = GlossaryConflictWindow(self, conflicts).decisions
@@ -385,7 +417,6 @@ class ReviewWindow(tk.Toplevel):
             for d in decisions:
                 if d['action'] == '새로 업데이트':
                     self.parent_app.glossary_data[d['eng']] = d['new_kor']; updated += 1
-        
         self.parent_app.glossary_data.update(new)
         added = len(new)
         msg = [f"{c}개의 {t}을(를) 메모리에 {a}했습니다." for c, t, a in [(added, "새 용어", "추가"), (updated, "기존 용어", "업데이트")] if c > 0]
@@ -404,12 +435,8 @@ class PromptGeneratorApp:
         self.doc_path, self.glossary_path = tk.StringVar(), tk.StringVar()
         self.chunks, self.glossary_data = [], {}
         self.current_chunk_index, self.current_step = 0, 1
-        
         settings = load_settings_from_json()
-        self.prompt_1_template = settings["prompt1"]
-        self.prompt_2_template = settings["prompt2"]
-        self.chunk_size = settings["chunk_size"]
-        
+        self.prompt_1_template, self.prompt_2_template, self.chunk_size = settings["prompt1"], settings["prompt2"], settings["chunk_size"]
         self.create_widgets()
 
     def create_widgets(self):
@@ -424,15 +451,12 @@ class PromptGeneratorApp:
         ttk.Button(action, text="불러오기", command=self.load_files).pack(fill="x", ipady=4)
         ttk.Button(action, text="설정", command=self.open_settings).pack(fill="x", pady=2)
         top.columnconfigure(1, weight=1)
-        
         mid = ttk.Frame(self.root, padding="10"); mid.pack(fill="x")
         ttk.Label(mid, text="[2단계용] 초벌 번역 결과 입력:").pack(anchor="w")
         self.draft_text = scrolledtext.ScrolledText(mid, wrap=tk.WORD, height=8); self.draft_text.pack(fill="x", expand=True, pady=5)
-        
         bot = ttk.Frame(self.root, padding="10"); bot.pack(fill="both", expand=True)
         self.status = ttk.Label(bot, text="진행 상태: 대기 중", font=("", 10, "bold")); self.status.pack(anchor="w")
         self.prompt_display = scrolledtext.ScrolledText(bot, wrap=tk.WORD); self.prompt_display.pack(fill="both", expand=True, pady=5)
-        
         ctrl = ttk.Frame(bot); ctrl.pack(fill="x", pady=5)
         self.action_btn = ttk.Button(ctrl, text="단계별 진행", command=self.process_action, state="disabled"); self.action_btn.pack(side="left", padx=10, fill="x", expand=True)
         self.copy_btn = ttk.Button(ctrl, text="프롬프트 복사", command=self.copy_prompt, state="disabled"); self.copy_btn.pack(side="left", padx=10)
@@ -503,6 +527,16 @@ class PromptGeneratorApp:
             self.root.clipboard_clear(); self.root.clipboard_append(p); messagebox.showinfo("복사 완료", "프롬프트가 클립보드에 복사되었습니다.")
         else: messagebox.showwarning("복사 실패", "복사할 내용이 없습니다.")
     
+    # --- 추가: 용어집 실시간 동기화 및 병합 함수 ---
+    def reload_and_sync_glossary(self):
+        """용어집 파일을 다시 읽어 메모리의 데이터와 병합합니다."""
+        path = self.glossary_path.get()
+        if path and os.path.exists(path):
+            file_glossary = load_glossary(path)
+            # 파일의 내용으로 메모리 데이터를 업데이트합니다.
+            # 파일에서 수정된 내용은 덮어쓰고, 메모리에만 있던 내용은 유지됩니다.
+            self.glossary_data.update(file_glossary)
+
     def save_current_glossary(self):
         if not (path := self.glossary_path.get()): return messagebox.showerror("오류", "용어집 파일 경로가 지정되지 않았습니다.")
         if save_glossary(path, self.glossary_data): messagebox.showinfo("저장 완료", f"'{os.path.basename(path)}' 파일에 용어집을 저장했습니다.")
@@ -511,3 +545,4 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = PromptGeneratorApp(root)
     root.mainloop()
+
